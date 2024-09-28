@@ -33,40 +33,9 @@ func StartTCPServer(port int) {
 	}
 }
 
-// handleConnection handles the interaction with a single client.
 func handleConnection(conn net.Conn) {
-	defer conn.Close()
-
-	// Print the remote address of the client.
 	fmt.Printf("Client connected from %s\n", conn.RemoteAddr().String())
 
-	// Send a basic SMTP greeting to the client.
-	greeting := "220 Welcome to GoMX Mail Server\r\n"
-	_, err := conn.Write([]byte(greeting))
-	if err != nil {
-		log.Printf("Error sending greeting: %v", err)
-		return
-	}
-
-	// Simple echo for demonstration (read client input and send it back)
-	buffer := make([]byte, 1024)
-	for {
-		n, err := conn.Read(buffer)
-		if err != nil {
-			log.Printf("Error reading from client: %v", err)
-			break
-		}
-
-		// Log client message
-		clientMsg := string(buffer[:n])
-		fmt.Printf("Received: %s", clientMsg)
-
-		// For SMTP servers, you’d parse and respond based on the protocol,
-		// but for now, we’ll just echo back the message for demo purposes.
-		_, err = conn.Write([]byte("Echo: " + clientMsg))
-		if err != nil {
-			log.Printf("Error sending response: %v", err)
-			break
-		}
-	}
+	// Handle SMTP commands for this session
+	HandleSMTPCommands(conn)
 }
