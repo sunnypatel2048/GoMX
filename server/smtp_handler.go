@@ -114,6 +114,27 @@ func handleCommand(command string, session *SMTPSession) string {
 	case "NOOP":
 		return "250 OK\r\n"
 
+	case ".":
+		if session.State == DataState {
+			session.MessageBody.WriteString(command)
+
+			// Parse and validate the message after receiving it.
+			message, err := ParseEmailMessage(session.MessageBody.String())
+			if err != nil {
+				return fmt.Sprintf("500 Failed to parse message: %v\r\n", err)
+			}
+
+			// Validate headers
+			if err := ValidateHeaders(message.Headers); err != nil {
+				return fmt.Sprintf("550 Header validation failed: %v\r\n", err)
+			}
+
+			// Successfully received and validated the message.
+			session.State = InitState
+			return "250 Message accepted for delivery\r\n"
+		}
+		return "503 Bad sequence of commands\r\n"
+
 	default:
 		return "500 Command not recognized\r\n"
 	}
