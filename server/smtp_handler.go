@@ -1,141 +1,140 @@
 package server
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"strings"
 )
 
-// Define the different states of an SMTP session
+// SessionState keeps track of the client's current state during an SMTP session.
+type SessionState int
+
 const (
-	InitState = iota
-	MailState
-	RcptState
-	DataState
-	QuitState
+	InitState     SessionState = iota // Initial state when the session starts.
+	HeloState                         // After receiving a valid HELO command.
+	MailFromState                     // After receiving a valid MAIL FROM command.
+	RcptState                         // After receiving a valid RCPT TO command.
+	DataState                         // After receiving a valid DATA command.
 )
 
-// SMTPSession holds the state and details of an SMTP session.
+// SMTPSession stores session-specific information.
 type SMTPSession struct {
-	State       int
-	Sender      string
-	Recipients  []string
-	MessageBody strings.Builder
+	State       SessionState    // Current state of the SMTP session.
+	Sender      string          // Sender's email address.
+	Recipients  []string        // List of recipient email addresses.
+	MessageBody strings.Builder // Stores the raw message body after the DATA command.
 }
 
-// NewSMTPSession initializes a new SMTP session with the initial state.
-func NewSMTPSession() *SMTPSession {
-	return &SMTPSession{
-		State:      InitState,
-		Recipients: make([]string, 0),
-	}
-}
-
-// HandleSMTPCommands handles client commands during an SMTP session.
-func HandleSMTPCommands(conn net.Conn) {
+// handleSMTPConnection handles incoming SMTP client connections.
+func handleSMTPConnection(conn net.Conn) {
 	defer conn.Close()
 
-	session := NewSMTPSession()
-	_, _ = conn.Write([]byte("220 Welcome to GoMX Mail Server\r\n"))
+	// Create a new SMTPSession for tracking the session state.
+	session := &SMTPSession{State: InitState}
 
-	buffer := make([]byte, 1024)
+	// Send initial greeting to the client.
+	sendResponse(conn, 220, "Welcome to GoMX Mail Server")
+
+	reader := bufio.NewReader(conn)
 	for {
-		n, err := conn.Read(buffer)
+		// Read the incoming command from the client.
+		command, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Error reading from client: %v", err)
-			break
+			sendResponse(conn, 421, "Service not available, closing transmission channel")
+			return
 		}
 
-		// Parse and handle commands
-		clientInput := string(buffer[:n])
-		response := handleCommand(clientInput, session)
-		if _, err = conn.Write([]byte(response)); err != nil {
-			fmt.Printf("Error sending response: %v", err)
-			break
+		// Trim command to remove extra whitespaces and newline characters.
+		command = strings.TrimSpace(command)
+		if len(command) == 0 {
+			continue
 		}
 
-		if session.State == QuitState {
-			break
+		// Split the command into command verb and arguments.
+		parts := strings.SplitN(command, " ", 2)
+		verb := strings.ToUpper(parts[0])
+		var args string
+		if len(parts) > 1 {
+			args = parts[1]
+		}
+
+		// Handle the SMTP command based on the current state.
+		response := handleCommand(session, verb, args)
+		if response != "" {
+			sendResponse(conn, parseSMTPCode(response), response)
+		}
+
+		// Close the connection if the client issues the QUIT command.
+		if verb == "QUIT" {
+			return
 		}
 	}
 }
 
-// handleCommand parses and executes SMTP commands based on session state.
-func handleCommand(command string, session *SMTPSession) string {
-	command = strings.TrimSpace(command)
-	parts := strings.SplitN(command, " ", 2)
-	cmd := strings.ToUpper(parts[0])
-	args := ""
-	if len(parts) > 1 {
-		args = parts[1]
-	}
-
-	switch cmd {
+// handleCommand processes each SMTP command and updates the session state accordingly.
+func handleCommand(session *SMTPSession, verb, args string) string {
+	switch verb {
 	case "HELO":
-		if session.State == InitState {
-			session.State = MailState
-			return "250 Hello " + args + "\r\n"
+		if len(args) > 0 {
+			session.State = HeloState
+			return fmt.Sprintf("250 Hello %s", args)
 		}
-		return "503 Bad sequence of commands\r\n"
+		return "501 Syntax error in parameters or arguments"
 
 	case "MAIL":
-		if strings.HasPrefix(args, "FROM:") && session.State == MailState {
-			session.Sender = strings.TrimPrefix(args, "FROM:")
-			session.State = RcptState
-			return "250 Sender OK\r\n"
+		if strings.HasPrefix(strings.ToUpper(args), "FROM:") && session.State == HeloState {
+			session.Sender = strings.TrimSpace(args[5:]) // Extract sender email.
+			session.State = MailFromState
+			return "250 Sender OK"
 		}
-		return "503 Bad sequence of commands\r\n"
+		return getErrorForState(session.State, HeloState)
 
 	case "RCPT":
-		if strings.HasPrefix(args, "TO:") && session.State == RcptState {
-			recipient := strings.TrimPrefix(args, "TO:")
+		if strings.HasPrefix(strings.ToUpper(args), "TO:") && session.State == MailFromState {
+			recipient := strings.TrimSpace(args[3:]) // Extract recipient email.
 			session.Recipients = append(session.Recipients, recipient)
-			return "250 Recipient OK\r\n"
+			session.State = RcptState
+			return "250 Recipient OK"
 		}
-		return "503 Bad sequence of commands\r\n"
+		return getErrorForState(session.State, MailFromState)
 
 	case "DATA":
 		if session.State == RcptState && len(session.Recipients) > 0 {
 			session.State = DataState
-			return "354 Start mail input; end with <CRLF>.<CRLF>\r\n"
+			return "354 Start mail input; end with <CRLF>.<CRLF>"
 		}
-		return "503 Bad sequence of commands\r\n"
-
-	case "QUIT":
-		session.State = QuitState
-		return "221 Bye\r\n"
-
-	case "RSET":
-		session.State = InitState
-		session.Sender = ""
-		session.Recipients = make([]string, 0)
-		return "250 Reset OK\r\n"
-
-	case "NOOP":
-		return "250 OK\r\n"
+		return "503 Bad sequence of commands"
 
 	case ".":
 		if session.State == DataState {
-			session.MessageBody.WriteString(command)
-
-			// Parse and validate the message after receiving it.
-			message, err := ParseEmailMessage(session.MessageBody.String())
-			if err != nil {
-				return fmt.Sprintf("500 Failed to parse message: %v\r\n", err)
-			}
-
-			// Validate headers
-			if err := ValidateHeaders(message.Headers); err != nil {
-				return fmt.Sprintf("550 Header validation failed: %v\r\n", err)
-			}
-
-			// Successfully received and validated the message.
 			session.State = InitState
-			return "250 Message accepted for delivery\r\n"
+			return "250 Message accepted for delivery"
 		}
-		return "503 Bad sequence of commands\r\n"
+		return "503 Bad sequence of commands"
+
+	case "QUIT":
+		return "221 Bye"
 
 	default:
-		return "500 Command not recognized\r\n"
+		return "500 Syntax error, command unrecognized"
 	}
+}
+
+// parseSMTPCode extracts the SMTP response code from a string message.
+func parseSMTPCode(message string) int {
+	var code int
+	_, err := fmt.Sscanf(message, "%d", &code)
+	if err != nil {
+		return 500 // Return 500 for unrecognized responses.
+	}
+	return code
+}
+
+// getErrorForState returns the appropriate error message for unexpected command sequences.
+func getErrorForState(current, required SessionState) string {
+	if current < required {
+		return "503 Bad sequence of commands"
+	}
+	return "501 Syntax error in parameters or arguments"
 }
